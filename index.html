@@ -1559,6 +1559,8 @@ let visInterval = null;
 let selectMode = false;
 let selectedIds = new Set();
 let _skipCount = 0;       // consecutive playback failures guard
+let _playGen = 0;         // playback generation counter (cancels stale playById calls)
+let _nextTrackTimer = null; // pending nextTrack timeout
 let lrcData = {};      // { trackId: [{time, text}, ...] }
 let lrcInterval = null;
 let _currentPdPlId = null; // track open playlist detail for refresh
@@ -1674,6 +1676,11 @@ function shuffle(arr) {
 }
 
 async function playById(trackId, resetQ=true) {
+  // Cancel any pending nextTrack timeout
+  if (_nextTrackTimer) { clearTimeout(_nextTrackTimer); _nextTrackTimer = null; }
+  // Generation counter — if another playById is called while we're async, abort
+  const gen = ++_playGen;
+
   const idx = library.findIndex(t=>t.id===trackId);
   if (idx<0) return;
   const track = library[idx];
@@ -1682,6 +1689,7 @@ async function playById(trackId, resetQ=true) {
   let audioURL = blobURLs[trackId]?.audioURL;
   if (!audioURL) {
     const stored = await dbGet(STORE_TRACKS, trackId).catch(()=>null);
+    if (gen !== _playGen) return; // stale — newer playById was called
     if (stored?.audioBlob) {
       if (!blobURLs[trackId]) blobURLs[trackId] = {};
       blobURLs[trackId].audioURL = URL.createObjectURL(stored.audioBlob);
@@ -1701,7 +1709,7 @@ async function playById(trackId, resetQ=true) {
       isPlaying = false; updatePlayIcons(); _skipCount = 0;
       return;
     }
-    setTimeout(()=>nextTrack(), 200);
+    _nextTrackTimer = setTimeout(()=>nextTrack(), 200);
     return;
   }
 
@@ -1713,6 +1721,7 @@ async function playById(trackId, resetQ=true) {
       if (audioCtx.state !== 'running') await audioCtx.resume();
     } catch(e) { console.warn('Ctx resume fail:',e); }
   }
+  if (gen !== _playGen) return; // stale
   unlockSilent();
 
   if (resetQ) buildQueue(trackId);
@@ -1724,39 +1733,24 @@ async function playById(trackId, resetQ=true) {
   audio.load(); // Force reload (fixes same-URL restart on iOS)
   audio.playbackRate = playSpeed;
 
-  // Try to play with retry
-  let played = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      await audio.play();
-      isPlaying = true;
-      played = true;
-      break;
-    } catch(e) {
-      console.warn('play attempt ' + (attempt+1) + ' failed:', e.message);
-      // On iOS, try suspending + resuming context
-      if (audioCtx && attempt < 2) {
-        try {
-          await audioCtx.suspend();
-          await new Promise(r => setTimeout(r, 100));
-          await audioCtx.resume();
-          await new Promise(r => setTimeout(r, 100));
-        } catch(e2) {}
-      }
-    }
-  }
-
-  if (!played) {
-    console.warn('All play attempts failed for', trackId, '- skipping');
+  // Single play attempt (no retry loop — avoids race conditions on rapid switch)
+  try {
+    await audio.play();
+    if (gen !== _playGen) return; // stale
+    isPlaying = true;
+  } catch(e) {
+    if (gen !== _playGen) return; // stale — another track was requested
+    console.warn('play failed for', trackId, e.message);
+    // Only skip/retry if this is still the active playback request
     isPlaying = false;
     updatePlayIcons();
     _skipCount++;
     if (_skipCount > queue.length + 1) {
       console.error('Too many consecutive skips — stopping');
-      isPlaying = false; updatePlayIcons(); _skipCount = 0;
+      _skipCount = 0;
       return;
     }
-    setTimeout(()=>nextTrack(), 900);
+    _nextTrackTimer = setTimeout(()=>nextTrack(), 900);
     return;
   }
 
