@@ -1561,6 +1561,7 @@ let selectedIds = new Set();
 let _skipCount = 0;       // consecutive playback failures guard
 let lrcData = {};      // { trackId: [{time, text}, ...] }
 let lrcInterval = null;
+let _currentPdPlId = null; // track open playlist detail for refresh
 
 // ─── AUDIO ENGINE ──────────────────────────────────────────
 const audio = document.createElement('video');
@@ -2507,6 +2508,21 @@ function renderAll() {
   renderFavorites();
   renderSidebarPlaylists();
   renderImportLib();
+  if (_currentPdPlId) refreshPlaylistDetail();
+}
+
+function refreshPlaylistDetail() {
+  const pl=playlists.find(p=>p.id===_currentPdPlId);
+  if (!pl) { _currentPdPlId=null; return; }
+  const tracks=pl.trackIds.map(id=>library.find(t=>t.id===id)).filter(Boolean);
+  const artUrl=pl.coverURL||(tracks[0]?blobURLs[tracks[0].id]?.artURL:null);
+  const artEl=artUrl?`<img src="${artUrl}" alt="" onerror="imgErr(this)">`:
+    `<div class="pd-art-ph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/></svg></div>`;
+  const pdArt=$('pd-hero-zone')?.querySelector('.pd-art');
+  if (pdArt) pdArt.innerHTML=artEl;
+  $('pd-tracks').innerHTML = tracks.length
+    ? tracks.map((t,i)=>trackItemHTML(t,i+1,false)).join('')
+    : `<div class="empty"><p>Playlist vide — ajoute des titres</p></div>`;
 }
 
 /* HOME */
@@ -2797,6 +2813,7 @@ function openPlaylistDetail(plId) {
     ? tracks.map((t,i)=>trackItemHTML(t,i+1,false)).join('')
     : `<div class="empty"><p>Playlist vide — ajoute des titres</p></div>`;
   $('pd-menu-btn').onclick=()=>openPlaylistMenu(pl.id);
+  _currentPdPlId = pl.id;
   nav('pdtail');
 }
 
@@ -3265,6 +3282,7 @@ function nav(viewName) {
   });
 
   currentView=viewName;
+  if(viewName!=='pdtail') _currentPdPlId=null;
   if(viewName==='equalizer') renderEQ();
   if(viewName==='radio') renderRadio();
   if(viewName==='search'){ setTimeout(()=>$('search-inp').focus(),100); renderSearchSuggestions(); }
