@@ -1690,6 +1690,11 @@ async function playById(trackId, resetQ=true) {
   // Generation counter — if another playById is called while we're async, abort
   const gen = ++_playGen;
 
+  // Yield one event-loop turn so rapid follow-up clicks can increment _playGen.
+  // This prevents starting heavy DB reads for clicks that will be cancelled anyway.
+  await new Promise(r => setTimeout(r, 0));
+  if (gen !== _playGen) return;
+
   const idx = library.findIndex(t=>t.id===trackId);
   if (idx<0) return;
   const track = library[idx];
@@ -2906,11 +2911,9 @@ function playAlbumTracks(ids) {
 
 /* HTML BUILDERS */
 function imgErr(el) {
+  // Just hide the broken image — don't insert placeholder elements
+  // (placeholder accumulation during rapid clicks caused visual corruption)
   el.style.display='none';
-  const ph=document.createElement('div');
-  ph.className=el.closest('.tart')?'tart-ph':'cthumb-ph';
-  ph.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 19V6l12-3v13"/><circle cx="6" cy="19" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
-  el.parentNode.insertBefore(ph,el.nextSibling);
 }
 function cardHTML(t) {
   const artUrl=blobURLs[t.id]?.artURL;
