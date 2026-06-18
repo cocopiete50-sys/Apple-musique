@@ -2020,8 +2020,9 @@ function updatePlayerUI() {
     navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
     navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
     navigator.mediaSession.setActionHandler('seekto', d=>{if(d.seekTime)audio.currentTime=d.seekTime;});
-    navigator.mediaSession.setActionHandler('seekbackward', d=>{audio.currentTime=Math.max(0,audio.currentTime-(d.seekOffset||10));});
-    navigator.mediaSession.setActionHandler('seekforward', d=>{audio.currentTime=Math.min(audio.duration,audio.currentTime+(d.seekOffset||10));});
+    // Don't register seekbackward/seekforward — iOS shows 10s skip buttons instead of prev/next track
+    try { navigator.mediaSession.setActionHandler('seekbackward', null); } catch(e){}
+    try { navigator.mediaSession.setActionHandler('seekforward', null); } catch(e){}
     navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
   }
 
@@ -3752,6 +3753,16 @@ async function init() {
     navigator.serviceWorker.register('./sw.js').then(reg => {
       // Check for updates periodically
       setInterval(() => reg.update(), 60 * 1000); // every 60s
+      // Notify user when update is available
+      reg.addEventListener('updatefound', () => {
+        const sw = reg.installing;
+        if (!sw) return;
+        sw.addEventListener('statechange', () => {
+          if (sw.state === 'activated' && navigator.serviceWorker.controller) {
+            toast('🔄 Mise à jour installée — relance l\'app pour l\'appliquer');
+          }
+        });
+      });
       console.log('SW registered');
     }).catch(e => console.warn('SW registration failed:', e));
   }
