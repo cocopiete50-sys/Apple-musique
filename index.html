@@ -1692,10 +1692,13 @@ async function playById(trackId, resetQ=true) {
   // Generation counter — if another playById is called while we're async, abort
   const gen = ++_playGen;
 
-  // Yield one event-loop turn so rapid follow-up clicks can increment _playGen.
-  // This prevents starting heavy DB reads for clicks that will be cancelled anyway.
-  await new Promise(r => setTimeout(r, 0));
-  if (gen !== _playGen) return;
+  // IMPORTANT: Resume AudioContext + unlock audio in user-gesture context
+  // BEFORE any await — iOS Safari requires user gesture for audio.play()
+  initAudio();
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(()=>{});
+  }
+  unlockSilent();
 
   const idx = library.findIndex(t=>t.id===trackId);
   if (idx<0) return;
@@ -1727,17 +1730,6 @@ async function playById(trackId, resetQ=true) {
     _nextTrackTimer = setTimeout(()=>nextTrack(), 200);
     return;
   }
-
-  initAudio();
-
-  // Force resume AudioContext (critical on iOS)
-  if (audioCtx) {
-    try {
-      if (audioCtx.state !== 'running') await audioCtx.resume();
-    } catch(e) { console.warn('Ctx resume fail:',e); }
-  }
-  if (gen !== _playGen) return; // stale
-  unlockSilent();
 
   if (resetQ) buildQueue(trackId);
   currentIdx = idx;
