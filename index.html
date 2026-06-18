@@ -351,10 +351,12 @@ body {
   position:fixed; bottom:0; left:0; right:0;
   z-index:100;
   padding:0 12px calc(var(--safe-b) + 8px);
-  background:var(--bg);
+  background:transparent;
+  pointer-events:none;
 }
 @media(min-width:701px){ #player-bar { left:var(--sidebar-w); } }
 #player-pill {
+  pointer-events:auto;
   background:linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
   backdrop-filter:blur(20px) saturate(180%);
   -webkit-backdrop-filter:blur(20px) saturate(180%);
@@ -1530,10 +1532,19 @@ function openDB() {
     req.onerror = () => rej(req.error);
   });
 }
-const dbGet = (store, key) => new Promise((res,rej)=>{ const r=db.transaction(store).objectStore(store).get(key); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
-const dbPut = (store, val) => new Promise((res,rej)=>{ const r=db.transaction(store,'readwrite').objectStore(store).put(val); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
-const dbDel = (store, key) => new Promise((res,rej)=>{ const r=db.transaction(store,'readwrite').objectStore(store).delete(key); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); });
-const dbAll = (store) => new Promise((res,rej)=>{ const r=db.transaction(store).objectStore(store).getAll(); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
+let _dbReopening = null;
+async function _dbReopen() {
+  if (_dbReopening) return _dbReopening;
+  _dbReopening = openDB().then(() => { _dbReopening = null; }).catch(() => { _dbReopening = null; });
+  return _dbReopening;
+}
+function _dbTx(store, mode) {
+  return db.transaction(store, mode);
+}
+const dbGet = (store, key) => new Promise((res,rej)=>{ try { const r=_dbTx(store,'readonly').objectStore(store).get(key); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); } catch(e){rej(e);} });
+const dbPut = (store, val, key) => new Promise((res,rej)=>{ try { const r=_dbTx(store,'readwrite').objectStore(store).put(val, key); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); } catch(e){rej(e);} });
+const dbDel = (store, key) => new Promise((res,rej)=>{ try { const r=_dbTx(store,'readwrite').objectStore(store).delete(key); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); } catch(e){rej(e);} });
+const dbAll = (store) => new Promise((res,rej)=>{ try { const r=_dbTx(store,'readonly').objectStore(store).getAll(); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); } catch(e){rej(e);} });
 
 // ─── STATE ─────────────────────────────────────────────────
 let library = [];      // track metadata (no blobs)
@@ -1559,8 +1570,11 @@ let visInterval = null;
 let selectMode = false;
 let selectedIds = new Set();
 let _skipCount = 0;       // consecutive playback failures guard
+let _playGen = 0;         // playback generation counter (cancels stale playById calls)
+let _nextTrackTimer = null; // pending nextTrack timeout
 let lrcData = {};      // { trackId: [{time, text}, ...] }
 let lrcInterval = null;
+let _currentPdPlId = null; // track open playlist detail for refresh
 
 // ─── AUDIO ENGINE ──────────────────────────────────────────
 const audio = document.createElement('video');
@@ -1673,23 +1687,39 @@ function shuffle(arr) {
 }
 
 async function playById(trackId, resetQ=true) {
+  // Cancel any pending nextTrack timeout
+  if (_nextTrackTimer) { clearTimeout(_nextTrackTimer); _nextTrackTimer = null; }
+  // Generation counter — if another playById is called while we're async, abort
+  const gen = ++_playGen;
+
+  // IMPORTANT: Resume AudioContext + unlock audio in user-gesture context
+  // BEFORE any await — iOS Safari requires user gesture for audio.play()
+  initAudio();
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(()=>{});
+  }
+  unlockSilent();
+  // Clear pause/sleep flags — user explicitly chose a new track to play
+  _userPaused = false;
+  _sleepStopped = false;
+
   const idx = library.findIndex(t=>t.id===trackId);
   if (idx<0) return;
   const track = library[idx];
 
-  // Get audio URL
-  let audioURL = blobURLs[trackId]?.audioURL;
-  if (!audioURL) {
-    const stored = await dbGet(STORE_TRACKS, trackId).catch(()=>null);
-    if (stored?.audioBlob) {
-      if (!blobURLs[trackId]) blobURLs[trackId] = {};
-      blobURLs[trackId].audioURL = URL.createObjectURL(stored.audioBlob);
-      audioURL = blobURLs[trackId].audioURL;
-    }
-    if (stored?.artBlob && !blobURLs[trackId]?.artURL) {
-      if (!blobURLs[trackId]) blobURLs[trackId] = {};
-      blobURLs[trackId].artURL = URL.createObjectURL(stored.artBlob);
-    }
+  // Get audio URL (reads from STORE_META — lightweight, no huge record load)
+  let audioURL = await getAudioURL(trackId);
+  if (gen !== _playGen) return; // stale — newer playById was called
+  // Get art URL if missing (reads from STORE_TRACKS — now lightweight, no audio blob)
+  if (!blobURLs[trackId]?.artURL) {
+    try {
+      const stored = await dbGet(STORE_TRACKS, trackId);
+      if (gen !== _playGen) return;
+      if (stored?.artBlob) {
+        if (!blobURLs[trackId]) blobURLs[trackId] = {};
+        blobURLs[trackId].artURL = URL.createObjectURL(stored.artBlob);
+      }
+    } catch(e) {}
   }
 
   if (!audioURL) {
@@ -1700,19 +1730,9 @@ async function playById(trackId, resetQ=true) {
       isPlaying = false; updatePlayIcons(); _skipCount = 0;
       return;
     }
-    setTimeout(()=>nextTrack(), 200);
+    _nextTrackTimer = setTimeout(()=>nextTrack(), 200);
     return;
   }
-
-  initAudio();
-
-  // Force resume AudioContext (critical on iOS)
-  if (audioCtx) {
-    try {
-      if (audioCtx.state !== 'running') await audioCtx.resume();
-    } catch(e) { console.warn('Ctx resume fail:',e); }
-  }
-  unlockSilent();
 
   if (resetQ) buildQueue(trackId);
   currentIdx = idx;
@@ -1723,39 +1743,24 @@ async function playById(trackId, resetQ=true) {
   audio.load(); // Force reload (fixes same-URL restart on iOS)
   audio.playbackRate = playSpeed;
 
-  // Try to play with retry
-  let played = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      await audio.play();
-      isPlaying = true;
-      played = true;
-      break;
-    } catch(e) {
-      console.warn('play attempt ' + (attempt+1) + ' failed:', e.message);
-      // On iOS, try suspending + resuming context
-      if (audioCtx && attempt < 2) {
-        try {
-          await audioCtx.suspend();
-          await new Promise(r => setTimeout(r, 100));
-          await audioCtx.resume();
-          await new Promise(r => setTimeout(r, 100));
-        } catch(e2) {}
-      }
-    }
-  }
-
-  if (!played) {
-    console.warn('All play attempts failed for', trackId, '- skipping');
+  // Single play attempt (no retry loop — avoids race conditions on rapid switch)
+  try {
+    await audio.play();
+    if (gen !== _playGen) return; // stale
+    isPlaying = true;
+  } catch(e) {
+    if (gen !== _playGen) return; // stale — another track was requested
+    console.warn('play failed for', trackId, e.message);
+    // Only skip/retry if this is still the active playback request
     isPlaying = false;
     updatePlayIcons();
     _skipCount++;
     if (_skipCount > queue.length + 1) {
       console.error('Too many consecutive skips — stopping');
-      isPlaying = false; updatePlayIcons(); _skipCount = 0;
+      _skipCount = 0;
       return;
     }
-    setTimeout(()=>nextTrack(), 900);
+    _nextTrackTimer = setTimeout(()=>nextTrack(), 900);
     return;
   }
 
@@ -1764,10 +1769,16 @@ async function playById(trackId, resetQ=true) {
   updateQueueUI();
   _skipCount = 0; // reset skip guard on successful play
   saveSession();
-  // Track last played
+  // Track last played (STORE_TRACKS is now lightweight — no audio blob)
   track.lastPlayed = Date.now();
-  dbPut(STORE_TRACKS, track).catch(()=>{});
-  renderHome();
+  const _gen = gen;
+  dbGet(STORE_TRACKS, track.id).then(rec => {
+    if (rec && _gen === _playGen) { rec.lastPlayed = track.lastPlayed; dbPut(STORE_TRACKS, rec); }
+  }).catch(()=>{});
+  // Only update what changed — avoid full renderAll() which destroys/recreates
+  // all 50+ images and causes visual corruption on iOS Safari
+  renderHome(); // update "recently played"
+  if (_currentPdPlId) refreshPlaylistDetail(); // update open playlist if any
   // Restart lyrics sync
   if (lrcInterval) { cancelAnimationFrame(lrcInterval); lrcInterval = null; }
   if ($('fp-lyrics').classList.contains('open')) renderLyrics();
@@ -1927,6 +1938,18 @@ audio.addEventListener('play', () => {
 });
 audio.addEventListener('pause', () => { isPlaying=false; updatePlayIcons(); updateArtState(); if('mediaSession' in navigator) navigator.mediaSession.playbackState='paused'; });
 
+// iOS Safari: register MediaSession action handlers during 'playing' event
+// This is required for next/prev track buttons to appear on lock screen
+audio.addEventListener('playing', () => {
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.setActionHandler('play', ()=>{ if(audioCtx?.state==='suspended')audioCtx.resume(); audio.play(); });
+    navigator.mediaSession.setActionHandler('pause', ()=>audio.pause());
+    navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
+    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
+    navigator.mediaSession.setActionHandler('seekto', d=>{if(d.seekTime)audio.currentTime=d.seekTime;});
+  }
+});
+
 // Request PiP for background audio on iOS — same trick as YouTube
 async function requestBackgroundPiP() {
   if (!('pictureInPictureEnabled' in document)) return;
@@ -1998,19 +2021,13 @@ function updatePlayerUI() {
     applyColors('#555','#222');
   }
 
-  // MediaSession
+  // MediaSession — only set metadata here; action handlers are set in 'playing' event
+  // (iOS Safari requires handlers to be registered during playback to show next/prev buttons)
   if ('mediaSession' in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({
       title:t.title, artist:t.artist, album:t.album,
       artwork: artURL ? [{src:artURL,sizes:'512x512',type:'image/jpeg'}] : []
     });
-    navigator.mediaSession.setActionHandler('play', ()=>{ if(audioCtx?.state==='suspended')audioCtx.resume(); audio.play(); });
-    navigator.mediaSession.setActionHandler('pause', ()=>audio.pause());
-    navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
-    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
-    navigator.mediaSession.setActionHandler('seekto', d=>{if(d.seekTime)audio.currentTime=d.seekTime;});
-    navigator.mediaSession.setActionHandler('seekbackward', d=>{audio.currentTime=Math.max(0,audio.currentTime-(d.seekOffset||10));});
-    navigator.mediaSession.setActionHandler('seekforward', d=>{audio.currentTime=Math.min(audio.duration,audio.currentTime+(d.seekOffset||10));});
     navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
   }
 
@@ -2154,7 +2171,7 @@ async function handleFiles(files) {
       const baseName = f.name.replace(/\.[^/.]+$/, '').toLowerCase();
       if (lrcMap[baseName] && meta) {
         lrcData[meta.id] = lrcMap[baseName];
-        try { await dbPut(STORE_META, { key:'lrc_'+meta.id, data:lrcMap[baseName] }); } catch(e) {}
+        try { await dbPut(STORE_META, { data:lrcMap[baseName] }, 'lrc_'+meta.id); } catch(e) {}
       }
     } catch(e) { console.error(e); }
     done++;
@@ -2168,8 +2185,10 @@ async function handleFiles(files) {
 async function importAudio(file, imgMap) {
   const tags = await readTags(file, file);
   const id = 'tr_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-  const duration = await getAudioDuration(URL.createObjectURL(file));
-  const audioBlob = file;
+  const tempUrl = URL.createObjectURL(file);
+  const duration = await getAudioDuration(tempUrl);
+  URL.revokeObjectURL(tempUrl);
+  const audioBlob = new Blob([await file.arrayBuffer()], { type: file.type || 'audio/mpeg' });
 
   // Art: try embedded tags first, then matching image file by track name only
   let artBlob = tags.artBlob || null;
@@ -2200,7 +2219,10 @@ async function importAudio(file, imgMap) {
     album: tags.album||'Album inconnu',
     duration, dateAdded:Date.now(), favorite:false
   };
-  await dbPut(STORE_TRACKS, { ...meta, audioBlob, artBlob });
+  // Store metadata + art in STORE_TRACKS (lightweight — no audio blob)
+  await dbPut(STORE_TRACKS, { ...meta, artBlob });
+  // Store audio blob separately in STORE_META (heavy data isolated)
+  await dbPut(STORE_META, audioBlob, 'audio_' + id);
   return meta;
 }
 
@@ -2220,7 +2242,8 @@ async function importVideo(file) {
       id, title:cleanName(file.name), artist:'Extrait vidéo',
       album:'Mes vidéos', duration, dateAdded:Date.now(), favorite:false, fromVideo:true
     };
-    await dbPut(STORE_TRACKS, { ...meta, audioBlob, artBlob:null });
+    await dbPut(STORE_TRACKS, { ...meta, artBlob:null });
+    await dbPut(STORE_META, audioBlob, 'audio_' + id);
     return meta;
   } catch(e) {
     // Fallback: store video file directly (most browsers can play video audio)
@@ -2229,7 +2252,9 @@ async function importVideo(file) {
       id, title:cleanName(file.name), artist:'Extrait vidéo',
       album:'Mes vidéos', duration, dateAdded:Date.now(), favorite:false, fromVideo:true
     };
-    await dbPut(STORE_TRACKS, { ...meta, audioBlob:file, artBlob:null });
+    const videoBlob = new Blob([await file.arrayBuffer()], { type: file.type || 'video/mp4' });
+    await dbPut(STORE_TRACKS, { ...meta, artBlob:null });
+    await dbPut(STORE_META, videoBlob, 'audio_' + id);
     return meta;
   }
 }
@@ -2462,36 +2487,78 @@ const cleanName = n => n.replace(/\.[^/.]+$/,'').replace(/[-_]+/g,' ').replace(/
 
 // ─── LIBRARY LOAD ──────────────────────────────────────────
 async function loadLibrary() {
-  const all = await dbAll(STORE_TRACKS);
-  library = all.map(({audioBlob,artBlob,...meta}) => meta); // strip blobs from memory
   // Revoke old URLs
   Object.values(blobURLs).forEach(u=>{
-    if(u.audioURL) URL.revokeObjectURL(u.audioURL);
     if(u.artURL) URL.revokeObjectURL(u.artURL);
   });
+  // Preserve existing audio URLs (don't revoke — audio might be playing)
+  const oldAudioURLs = {};
+  Object.entries(blobURLs).forEach(([id, u]) => {
+    if(u.audioURL) oldAudioURLs[id] = u.audioURL;
+  });
   blobURLs = {};
-  // Pre-create art URLs (small — just for display)
-  for (const rec of all) {
-    if (rec.artBlob) {
-      blobURLs[rec.id] = blobURLs[rec.id] || {};
-      blobURLs[rec.id].artURL = URL.createObjectURL(rec.artBlob);
-    }
-  }
+  // Restore preserved audio URLs
+  Object.entries(oldAudioURLs).forEach(([id, url]) => {
+    blobURLs[id] = { audioURL: url };
+  });
+
+  // Use cursor to iterate one record at a time — avoids loading all audio blobs into memory
+  library = [];
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_TRACKS, 'readonly');
+    const store = tx.objectStore(STORE_TRACKS);
+    const req = store.openCursor();
+    req.onsuccess = e => {
+      const cursor = e.target.result;
+      if (!cursor) { resolve(); return; }
+      const rec = cursor.value;
+      // Extract metadata only (no blobs in memory)
+      const { audioBlob, artBlob, ...meta } = rec;
+      library.push(meta);
+      // Create art URL if artBlob exists
+      if (artBlob) {
+        blobURLs[rec.id] = blobURLs[rec.id] || {};
+        blobURLs[rec.id].artURL = URL.createObjectURL(artBlob);
+      }
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+  });
+
   playlists = await dbAll(STORE_PL);
 
   // Load LRC data
   lrcData = {};
-  for (const rec of all) {
-    const lrcRec = await dbGet(STORE_META, 'lrc_' + rec.id).catch(() => null);
-    if (lrcRec?.data) lrcData[rec.id] = lrcRec.data;
+  for (const t of library) {
+    const lrcRec = await dbGet(STORE_META, 'lrc_' + t.id).catch(() => null);
+    if (lrcRec?.data) lrcData[t.id] = lrcRec.data;
   }
 }
 
 async function getAudioURL(trackId) {
   if (blobURLs[trackId]?.audioURL) return blobURLs[trackId].audioURL;
-  const rec = await dbGet(STORE_TRACKS, trackId);
-  if (!rec?.audioBlob) return null;
-  const url = URL.createObjectURL(rec.audioBlob);
+  let audioBlob = null;
+  // New format: audio stored separately in STORE_META
+  try {
+    const stored = await dbGet(STORE_META, 'audio_' + trackId);
+    if (stored) audioBlob = (stored instanceof Blob) ? stored : new Blob([stored]);
+  } catch(e) {}
+  // Fallback: old format with audioBlob in STORE_TRACKS — migrate it
+  if (!audioBlob) {
+    try {
+      const rec = await dbGet(STORE_TRACKS, trackId);
+      if (rec?.audioBlob) {
+        audioBlob = rec.audioBlob;
+        // Migrate: move audio to STORE_META, remove from STORE_TRACKS
+        await dbPut(STORE_META, audioBlob, 'audio_' + trackId).catch(()=>{});
+        delete rec.audioBlob;
+        await dbPut(STORE_TRACKS, rec).catch(()=>{});
+      }
+    } catch(e) {}
+  }
+  if (!audioBlob) return null;
+  const url = URL.createObjectURL(audioBlob);
   blobURLs[trackId] = blobURLs[trackId] || {};
   blobURLs[trackId].audioURL = url;
   return url;
@@ -2507,6 +2574,21 @@ function renderAll() {
   renderFavorites();
   renderSidebarPlaylists();
   renderImportLib();
+  if (_currentPdPlId) refreshPlaylistDetail();
+}
+
+function refreshPlaylistDetail() {
+  const pl=playlists.find(p=>p.id===_currentPdPlId);
+  if (!pl) { _currentPdPlId=null; return; }
+  const tracks=pl.trackIds.map(id=>library.find(t=>t.id===id)).filter(Boolean);
+  const artUrl=pl.coverURL||(tracks[0]?blobURLs[tracks[0].id]?.artURL:null);
+  const artEl=artUrl?`<img src="${artUrl}" alt="" onerror="imgErr(this)">`:
+    `<div class="pd-art-ph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/></svg></div>`;
+  const pdArt=$('pd-hero-zone')?.querySelector('.pd-art');
+  if (pdArt) pdArt.innerHTML=artEl;
+  $('pd-tracks').innerHTML = tracks.length
+    ? tracks.map((t,i)=>trackItemHTML(t,i+1,false)).join('')
+    : `<div class="empty"><p>Playlist vide — ajoute des titres</p></div>`;
 }
 
 /* HOME */
@@ -2797,6 +2879,7 @@ function openPlaylistDetail(plId) {
     ? tracks.map((t,i)=>trackItemHTML(t,i+1,false)).join('')
     : `<div class="empty"><p>Playlist vide — ajoute des titres</p></div>`;
   $('pd-menu-btn').onclick=()=>openPlaylistMenu(pl.id);
+  _currentPdPlId = pl.id;
   nav('pdtail');
 }
 
@@ -2834,7 +2917,9 @@ function playAlbumTracks(ids) {
 
 /* HTML BUILDERS */
 function imgErr(el) {
-  el.outerHTML='<div class="cthumb-ph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 19V6l12-3v13"/><circle cx="6" cy="19" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>';
+  // Replace broken image with inline SVG placeholder — no DOM insertion
+  el.removeAttribute('onerror'); // prevent infinite loop
+  el.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><rect width="48" height="48" fill="%23282828"/><path d="M18 38V14l22-6v24" fill="none" stroke="%23555" stroke-width="2"/><circle cx="15" cy="38" r="4" fill="%23555"/><circle cx="37" cy="32" r="4" fill="%23555"/></svg>');
 }
 function cardHTML(t) {
   const artUrl=blobURLs[t.id]?.artURL;
@@ -3079,10 +3164,6 @@ function changeTrackArt(trackId) {
         blobURLs[trackId] = {};
       }
       blobURLs[trackId].artURL = URL.createObjectURL(blob);
-      const libIdx = library.findIndex(t => t.id === trackId);
-      if (libIdx >= 0) {
-        library[libIdx] = { ...library[libIdx], artBlob: blob };
-      }
       const rec = await dbGet(STORE_TRACKS, trackId);
       if (rec) {
         rec.artBlob = blob;
@@ -3111,6 +3192,8 @@ function addToQueue(trackId) {
 }
 async function removeTrack(trackId) {
   await dbDel(STORE_TRACKS, trackId);
+  await dbDel(STORE_META, 'audio_' + trackId).catch(()=>{});
+  await dbDel(STORE_META, 'lrc_' + trackId).catch(()=>{});
   if(blobURLs[trackId]?.audioURL) URL.revokeObjectURL(blobURLs[trackId].audioURL);
   if(blobURLs[trackId]?.artURL) URL.revokeObjectURL(blobURLs[trackId].artURL);
   delete blobURLs[trackId];
@@ -3265,6 +3348,7 @@ function nav(viewName) {
   });
 
   currentView=viewName;
+  if(viewName!=='pdtail') _currentPdPlId=null;
   if(viewName==='equalizer') renderEQ();
   if(viewName==='radio') renderRadio();
   if(viewName==='search'){ setTimeout(()=>$('search-inp').focus(),100); renderSearchSuggestions(); }
@@ -3406,14 +3490,13 @@ function closeModal() { $('modal-ov').classList.remove('open'); }
 async function savePref() {
   try {
     await dbPut(STORE_META, {
-      key:'prefs',
       isShuffle,repeatMode,eqEnabled,eqVals,sortMode,playSpeed
-    });
+    }, 'prefs');
   } catch(e){}
 }
 async function saveSession() {
   try {
-    if(currentIdx>=0) await dbPut(STORE_META,{key:'session',trackId:library[currentIdx]?.id, queueIdx, queue});
+    if(currentIdx>=0) await dbPut(STORE_META,{trackId:library[currentIdx]?.id, queueIdx, queue}, 'session');
   } catch(e){}
 }
 async function loadPrefs() {
@@ -3425,6 +3508,27 @@ async function loadPrefs() {
   eqVals=p.eqVals||[0,0,0,0,0,0,0,0,0,0];
   sortMode=p.sortMode||'dateAdded';
   playSpeed=p.playSpeed||1;
+}
+
+async function restoreSession() {
+  try {
+    const s = await dbGet(STORE_META, 'session').catch(() => null);
+    if (!s || !s.trackId) return;
+    const idx = library.findIndex(t => t.id === s.trackId);
+    if (idx < 0) return;
+    currentIdx = idx;
+    if (s.queue && s.queue.length) {
+      queue = s.queue.filter(id => library.find(t => t.id === id));
+      queueIdx = typeof s.queueIdx === 'number' ? s.queueIdx : 0;
+      if (queueIdx >= queue.length) queueIdx = 0;
+    }
+    // Pre-load audio URL so play button works immediately
+    await getAudioURL(s.trackId);
+    // Update player UI to show last track (paused state)
+    updatePlayerUI();
+    updateTrackHighlights();
+    updateQueueUI();
+  } catch(e) { console.warn('restoreSession fail:', e); }
 }
 
 // ─── TOAST ─────────────────────────────────────────────────
@@ -3527,11 +3631,13 @@ async function clearAllData() {
 async function doClearAll() {
   const stores = ['tracks', 'meta', 'playlists'];
   for (const s of stores) {
-    const all = await dbAll(s);
-    for (const item of all) {
-      const key = item.key !== undefined ? item.key : item.id;
-      if (key !== undefined) await dbDel(s, key);
-    }
+    await new Promise((res, rej) => {
+      try {
+        const r = _dbTx(s, 'readwrite').objectStore(s).clear();
+        r.onsuccess = () => res();
+        r.onerror = () => rej(r.error);
+      } catch(e) { rej(e); }
+    }).catch(() => {});
   }
   library = []; playlists = []; blobURLs = {};
   if (audio) { audio.pause(); isPlaying = false; currentIdx = -1; }
@@ -3544,14 +3650,20 @@ async function doClearAll() {
 function openMobileMore() { $('mobile-more-sheet').classList.add('open'); }
 function closeMobileMore() { $('mobile-more-sheet').classList.remove('open'); }
 
+// ─── SAVE SESSION ON CLOSE/REFRESH ──────────────────────
+window.addEventListener('beforeunload', () => { saveSession(); savePref(); });
+// Periodic save every 30s while playing
+setInterval(() => { if (isPlaying && currentIdx >= 0) saveSession(); }, 30000);
+
 // ─── iOS BACKGROUND AUDIO ───────────────────────────────
 // Save position when going to background
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     // App going to background — save position
-    if (isPlaying) saveSession();
+    saveSession();
   } else {
-    // App returning to foreground
+    // App returning to foreground — reopen DB if iOS Safari closed it
+    _dbReopen().catch(()=>{});
     // If user had paused or sleep stopped, iOS may auto-resume audio — force pause it
     if ((_userPaused || _sleepStopped) && !audio.paused) {
       audio.pause();
@@ -3603,11 +3715,26 @@ function unlockSilent() {
 async function init() {
   $('splash-msg').textContent = 'Ouverture de la base de données…';
   try { await openDB(); }
-  catch(e) { console.error('DB fail',e); }
+  catch(e) {
+    console.error('DB fail',e);
+    $('splash-msg').textContent = '⚠️ Erreur de base de données — réessaie de recharger';
+    return;
+  }
+
+  // Request persistent storage (prevents iOS/Safari from evicting IndexedDB)
+  if (navigator.storage && navigator.storage.persist) {
+    try {
+      const granted = await navigator.storage.persist();
+      console.log('Persistent storage:', granted ? 'granted' : 'denied');
+    } catch(e) { console.warn('storage.persist() fail:', e); }
+  }
 
   $('splash-msg').textContent = 'Chargement de la bibliothèque…';
   await loadPrefs();
   await loadLibrary();
+
+  // Restore last session (track + queue)
+  await restoreSession();
 
   renderAll();
   adjustForKeyboard();
@@ -3625,6 +3752,25 @@ async function init() {
   const splash=$('splash');
   splash.style.opacity='0';
   setTimeout(()=>splash.remove(),600);
+
+  // Register Service Worker for auto-updates
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').then(reg => {
+      // Check for updates periodically
+      setInterval(() => reg.update(), 60 * 1000); // every 60s
+      // Notify user when update is available
+      reg.addEventListener('updatefound', () => {
+        const sw = reg.installing;
+        if (!sw) return;
+        sw.addEventListener('statechange', () => {
+          if (sw.state === 'activated' && navigator.serviceWorker.controller) {
+            toast('🔄 Mise à jour installée — relance l\'app pour l\'appliquer');
+          }
+        });
+      });
+      console.log('SW registered');
+    }).catch(e => console.warn('SW registration failed:', e));
+  }
 
   console.log('🎵 Coco Music v3 ready —', library.length, 'tracks in library');
 }
