@@ -1938,6 +1938,18 @@ audio.addEventListener('play', () => {
 });
 audio.addEventListener('pause', () => { isPlaying=false; updatePlayIcons(); updateArtState(); if('mediaSession' in navigator) navigator.mediaSession.playbackState='paused'; });
 
+// iOS Safari: register MediaSession action handlers during 'playing' event
+// This is required for next/prev track buttons to appear on lock screen
+audio.addEventListener('playing', () => {
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.setActionHandler('play', ()=>{ if(audioCtx?.state==='suspended')audioCtx.resume(); audio.play(); });
+    navigator.mediaSession.setActionHandler('pause', ()=>audio.pause());
+    navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
+    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
+    navigator.mediaSession.setActionHandler('seekto', d=>{if(d.seekTime)audio.currentTime=d.seekTime;});
+  }
+});
+
 // Request PiP for background audio on iOS — same trick as YouTube
 async function requestBackgroundPiP() {
   if (!('pictureInPictureEnabled' in document)) return;
@@ -2009,20 +2021,13 @@ function updatePlayerUI() {
     applyColors('#555','#222');
   }
 
-  // MediaSession
+  // MediaSession — only set metadata here; action handlers are set in 'playing' event
+  // (iOS Safari requires handlers to be registered during playback to show next/prev buttons)
   if ('mediaSession' in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({
       title:t.title, artist:t.artist, album:t.album,
       artwork: artURL ? [{src:artURL,sizes:'512x512',type:'image/jpeg'}] : []
     });
-    navigator.mediaSession.setActionHandler('play', ()=>{ if(audioCtx?.state==='suspended')audioCtx.resume(); audio.play(); });
-    navigator.mediaSession.setActionHandler('pause', ()=>audio.pause());
-    navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
-    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
-    navigator.mediaSession.setActionHandler('seekto', d=>{if(d.seekTime)audio.currentTime=d.seekTime;});
-    // Don't register seekbackward/seekforward — iOS shows 10s skip buttons instead of prev/next track
-    try { navigator.mediaSession.setActionHandler('seekbackward', null); } catch(e){}
-    try { navigator.mediaSession.setActionHandler('seekforward', null); } catch(e){}
     navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
   }
 
