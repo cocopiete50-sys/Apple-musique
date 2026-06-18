@@ -3445,6 +3445,27 @@ async function loadPrefs() {
   playSpeed=p.playSpeed||1;
 }
 
+async function restoreSession() {
+  try {
+    const s = await dbGet(STORE_META, 'session').catch(() => null);
+    if (!s || !s.trackId) return;
+    const idx = library.findIndex(t => t.id === s.trackId);
+    if (idx < 0) return;
+    currentIdx = idx;
+    if (s.queue && s.queue.length) {
+      queue = s.queue.filter(id => library.find(t => t.id === id));
+      queueIdx = typeof s.queueIdx === 'number' ? s.queueIdx : 0;
+      if (queueIdx >= queue.length) queueIdx = 0;
+    }
+    // Pre-load audio URL so play button works immediately
+    await getAudioURL(s.trackId);
+    // Update player UI to show last track (paused state)
+    updatePlayerUI();
+    updateTrackHighlights();
+    updateQueueUI();
+  } catch(e) { console.warn('restoreSession fail:', e); }
+}
+
 // ─── TOAST ─────────────────────────────────────────────────
 function toast(msg, dur=2800) {
   const wrap=$('toast-wrap');
@@ -3562,12 +3583,17 @@ async function doClearAll() {
 function openMobileMore() { $('mobile-more-sheet').classList.add('open'); }
 function closeMobileMore() { $('mobile-more-sheet').classList.remove('open'); }
 
+// ─── SAVE SESSION ON CLOSE/REFRESH ──────────────────────
+window.addEventListener('beforeunload', () => { saveSession(); savePref(); });
+// Periodic save every 30s while playing
+setInterval(() => { if (isPlaying && currentIdx >= 0) saveSession(); }, 30000);
+
 // ─── iOS BACKGROUND AUDIO ───────────────────────────────
 // Save position when going to background
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     // App going to background — save position
-    if (isPlaying) saveSession();
+    saveSession();
   } else {
     // App returning to foreground
     // If user had paused or sleep stopped, iOS may auto-resume audio — force pause it
@@ -3621,11 +3647,26 @@ function unlockSilent() {
 async function init() {
   $('splash-msg').textContent = 'Ouverture de la base de données…';
   try { await openDB(); }
-  catch(e) { console.error('DB fail',e); }
+  catch(e) {
+    console.error('DB fail',e);
+    $('splash-msg').textContent = '⚠️ Erreur de base de données — réessaie de recharger';
+    return;
+  }
+
+  // Request persistent storage (prevents iOS/Safari from evicting IndexedDB)
+  if (navigator.storage && navigator.storage.persist) {
+    try {
+      const granted = await navigator.storage.persist();
+      console.log('Persistent storage:', granted ? 'granted' : 'denied');
+    } catch(e) { console.warn('storage.persist() fail:', e); }
+  }
 
   $('splash-msg').textContent = 'Chargement de la bibliothèque…';
   await loadPrefs();
   await loadLibrary();
+
+  // Restore last session (track + queue)
+  await restoreSession();
 
   renderAll();
   adjustForKeyboard();
