@@ -1699,6 +1699,9 @@ async function playById(trackId, resetQ=true) {
     audioCtx.resume().catch(()=>{});
   }
   unlockSilent();
+  // Clear pause/sleep flags — user explicitly chose a new track to play
+  _userPaused = false;
+  _sleepStopped = false;
 
   const idx = library.findIndex(t=>t.id===trackId);
   if (idx<0) return;
