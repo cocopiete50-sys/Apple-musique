@@ -1765,9 +1765,11 @@ async function playById(trackId, resetQ=true) {
   updateQueueUI();
   _skipCount = 0; // reset skip guard on successful play
   saveSession();
-  // Track last played
+  // Track last played (read full record to preserve blobs)
   track.lastPlayed = Date.now();
-  dbPut(STORE_TRACKS, track).catch(()=>{});
+  dbGet(STORE_TRACKS, track.id).then(rec => {
+    if (rec) { rec.lastPlayed = track.lastPlayed; dbPut(STORE_TRACKS, rec); }
+  }).catch(()=>{});
   renderAll();
   // Restart lyrics sync
   if (lrcInterval) { cancelAnimationFrame(lrcInterval); lrcInterval = null; }
@@ -2466,28 +2468,52 @@ const cleanName = n => n.replace(/\.[^/.]+$/,'').replace(/[-_]+/g,' ').replace(/
 
 // ─── LIBRARY LOAD ──────────────────────────────────────────
 async function loadLibrary() {
-  const all = await dbAll(STORE_TRACKS);
-  library = all.map(({audioBlob,artBlob,...meta}) => meta); // strip blobs from memory
   // Revoke old URLs
   Object.values(blobURLs).forEach(u=>{
-    if(u.audioURL) URL.revokeObjectURL(u.audioURL);
     if(u.artURL) URL.revokeObjectURL(u.artURL);
   });
+  // Preserve existing audio URLs (don't revoke — audio might be playing)
+  const oldAudioURLs = {};
+  Object.entries(blobURLs).forEach(([id, u]) => {
+    if(u.audioURL) oldAudioURLs[id] = u.audioURL;
+  });
   blobURLs = {};
-  // Pre-create art URLs (small — just for display)
-  for (const rec of all) {
-    if (rec.artBlob) {
-      blobURLs[rec.id] = blobURLs[rec.id] || {};
-      blobURLs[rec.id].artURL = URL.createObjectURL(rec.artBlob);
-    }
-  }
+  // Restore preserved audio URLs
+  Object.entries(oldAudioURLs).forEach(([id, url]) => {
+    blobURLs[id] = { audioURL: url };
+  });
+
+  // Use cursor to iterate one record at a time — avoids loading all audio blobs into memory
+  library = [];
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_TRACKS, 'readonly');
+    const store = tx.objectStore(STORE_TRACKS);
+    const req = store.openCursor();
+    req.onsuccess = e => {
+      const cursor = e.target.result;
+      if (!cursor) { resolve(); return; }
+      const rec = cursor.value;
+      // Extract metadata only (no blobs in memory)
+      const { audioBlob, artBlob, ...meta } = rec;
+      library.push(meta);
+      // Create art URL if artBlob exists
+      if (artBlob) {
+        blobURLs[rec.id] = blobURLs[rec.id] || {};
+        blobURLs[rec.id].artURL = URL.createObjectURL(artBlob);
+      }
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+  });
+
   playlists = await dbAll(STORE_PL);
 
   // Load LRC data
   lrcData = {};
-  for (const rec of all) {
-    const lrcRec = await dbGet(STORE_META, 'lrc_' + rec.id).catch(() => null);
-    if (lrcRec?.data) lrcData[rec.id] = lrcRec.data;
+  for (const t of library) {
+    const lrcRec = await dbGet(STORE_META, 'lrc_' + t.id).catch(() => null);
+    if (lrcRec?.data) lrcData[t.id] = lrcRec.data;
   }
 }
 
