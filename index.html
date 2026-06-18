@@ -1767,7 +1767,7 @@ async function playById(trackId, resetQ=true) {
   // Track last played
   track.lastPlayed = Date.now();
   dbPut(STORE_TRACKS, track).catch(()=>{});
-  renderHome();
+  renderAll();
   // Restart lyrics sync
   if (lrcInterval) { cancelAnimationFrame(lrcInterval); lrcInterval = null; }
   if ($('fp-lyrics').classList.contains('open')) renderLyrics();
@@ -2834,7 +2834,11 @@ function playAlbumTracks(ids) {
 
 /* HTML BUILDERS */
 function imgErr(el) {
-  el.outerHTML='<div class="cthumb-ph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 19V6l12-3v13"/><circle cx="6" cy="19" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>';
+  el.style.display='none';
+  const ph=document.createElement('div');
+  ph.className=el.closest('.tart')?'tart-ph':'cthumb-ph';
+  ph.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 19V6l12-3v13"/><circle cx="6" cy="19" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+  el.parentNode.insertBefore(ph,el.nextSibling);
 }
 function cardHTML(t) {
   const artUrl=blobURLs[t.id]?.artURL;
@@ -3079,10 +3083,6 @@ function changeTrackArt(trackId) {
         blobURLs[trackId] = {};
       }
       blobURLs[trackId].artURL = URL.createObjectURL(blob);
-      const libIdx = library.findIndex(t => t.id === trackId);
-      if (libIdx >= 0) {
-        library[libIdx] = { ...library[libIdx], artBlob: blob };
-      }
       const rec = await dbGet(STORE_TRACKS, trackId);
       if (rec) {
         rec.artBlob = blob;
