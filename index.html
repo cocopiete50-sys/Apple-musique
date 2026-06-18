@@ -1531,7 +1531,7 @@ function openDB() {
   });
 }
 const dbGet = (store, key) => new Promise((res,rej)=>{ const r=db.transaction(store).objectStore(store).get(key); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
-const dbPut = (store, val) => new Promise((res,rej)=>{ const r=db.transaction(store,'readwrite').objectStore(store).put(val); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
+const dbPut = (store, val, key) => new Promise((res,rej)=>{ const r=db.transaction(store,'readwrite').objectStore(store).put(val, key); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
 const dbDel = (store, key) => new Promise((res,rej)=>{ const r=db.transaction(store,'readwrite').objectStore(store).delete(key); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); });
 const dbAll = (store) => new Promise((res,rej)=>{ const r=db.transaction(store).objectStore(store).getAll(); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
 
@@ -2155,7 +2155,7 @@ async function handleFiles(files) {
       const baseName = f.name.replace(/\.[^/.]+$/, '').toLowerCase();
       if (lrcMap[baseName] && meta) {
         lrcData[meta.id] = lrcMap[baseName];
-        try { await dbPut(STORE_META, { key:'lrc_'+meta.id, data:lrcMap[baseName] }); } catch(e) {}
+        try { await dbPut(STORE_META, { data:lrcMap[baseName] }, 'lrc_'+meta.id); } catch(e) {}
       }
     } catch(e) { console.error(e); }
     done++;
@@ -2169,8 +2169,10 @@ async function handleFiles(files) {
 async function importAudio(file, imgMap) {
   const tags = await readTags(file, file);
   const id = 'tr_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-  const duration = await getAudioDuration(URL.createObjectURL(file));
-  const audioBlob = file;
+  const tempUrl = URL.createObjectURL(file);
+  const duration = await getAudioDuration(tempUrl);
+  URL.revokeObjectURL(tempUrl);
+  const audioBlob = new Blob([await file.arrayBuffer()], { type: file.type || 'audio/mpeg' });
 
   // Art: try embedded tags first, then matching image file by track name only
   let artBlob = tags.artBlob || null;
@@ -2230,7 +2232,8 @@ async function importVideo(file) {
       id, title:cleanName(file.name), artist:'Extrait vidéo',
       album:'Mes vidéos', duration, dateAdded:Date.now(), favorite:false, fromVideo:true
     };
-    await dbPut(STORE_TRACKS, { ...meta, audioBlob:file, artBlob:null });
+    const videoBlob = new Blob([await file.arrayBuffer()], { type: file.type || 'video/mp4' });
+    await dbPut(STORE_TRACKS, { ...meta, audioBlob:videoBlob, artBlob:null });
     return meta;
   }
 }
@@ -3424,14 +3427,13 @@ function closeModal() { $('modal-ov').classList.remove('open'); }
 async function savePref() {
   try {
     await dbPut(STORE_META, {
-      key:'prefs',
       isShuffle,repeatMode,eqEnabled,eqVals,sortMode,playSpeed
-    });
+    }, 'prefs');
   } catch(e){}
 }
 async function saveSession() {
   try {
-    if(currentIdx>=0) await dbPut(STORE_META,{key:'session',trackId:library[currentIdx]?.id, queueIdx, queue});
+    if(currentIdx>=0) await dbPut(STORE_META,{trackId:library[currentIdx]?.id, queueIdx, queue}, 'session');
   } catch(e){}
 }
 async function loadPrefs() {
